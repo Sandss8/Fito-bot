@@ -1,3 +1,6 @@
+import sqlite3
+from datetime import datetime
+from dp import Database
 import os
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
@@ -9,6 +12,9 @@ from telegram.ext import (
 # Загружаем токен из .env
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+
+# Инициализируем базу данных
+db = Database()
 
 # Константы для состояний
 GENDER, AGE, HEIGHT, WEIGHT, ACTIVITY_LEVEL = range(5)
@@ -217,8 +223,26 @@ async def activity_level_handler(update: Update, context: ContextTypes.DEFAULT_T
         "Это примерная норма для поддержания текущего веса."
     )
 
-    # Показать меню после расчета
+    # Подготавливаем данные для сохранения
+    user_data = {
+        'user_id': update.message.chat.id,
+        'username': update.message.chat.username,
+        'first_name': update.message.chat.first_name,
+        'last_name': update.message.chat.last_name,
+        'gender': gender,
+        'age': age,
+        'height': height,
+        'weight': weight,
+        'activity_level': activity,
+        'bmr': bmr,
+        'daily_calories': daily_calories,
+        'registration_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
 
+    # Сохраняем данные через наш класс Database
+    db.save_user_data(user_data)
+
+    # Показать меню после расчета
     reply_keyboard = [["Подсчёт ккал блюда"]]
     await update.message.reply_text(
         "Что дальше хочешь сделать?",
