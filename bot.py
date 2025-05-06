@@ -2,10 +2,17 @@ import os
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, ConversationHandler
+import  sqlite3
+from datetime import datetime
+from dp import  Database
 
 # Загружаем токен из .env
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+
+# инициализируем базу данных
+db = Database()
+
 
 # Константы для состояний
 GENDER, AGE, HEIGHT, WEIGHT, ACTIVITY_LEVEL = range(5)
@@ -164,6 +171,26 @@ async def activity_level_handler(update: Update, context: ContextTypes.DEFAULT_T
         bmr = (10 * weight) + (6.25 * height) - (5 * age) - 161
 
     daily_calories = bmr * activity_factor
+
+    # Подготавливаем данные для сохранения
+    user_data = {
+        'user_id': update.message.chat.id,
+        'username': update.message.chat.username,
+        'first_name': update.message.chat.first_name,
+        'last_name': update.message.chat.last_name,
+        'gender': gender,
+        'age': age,
+        'height': height,
+        'weight': weight,
+        'activity_level': activity,
+        'bmr': bmr,
+        'daily_calories': daily_calories,
+        'registration_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+
+
+    # Сохраняем данные через наш класс Database
+    db.save_user_data(user_data)
 
     await update.message.reply_text(
         "📊 Результаты расчета:\n\n"
