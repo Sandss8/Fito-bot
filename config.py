@@ -11,10 +11,7 @@ class Config:
     FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
 
     # Состояния бота
-    (
-        GENDER, AGE, HEIGHT, WEIGHT, ACTIVITY_LEVEL,
-        CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT
-    ) = range(8)
+    (GENDER, AGE, HEIGHT, WEIGHT, ACTIVITY_LEVEL,CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT) = range(8)
 
     # Уровни активности
     ACTIVITY_LEVELS = [
