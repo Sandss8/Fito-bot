@@ -333,8 +333,10 @@ async def enter_dish_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ENTER_WEIGHT
 
     except Exception as e:
-        logger.error(f"Error in enter_dish_name: {e}")
-        await update.message.reply_text("❌ Произошла ошибка при поиске блюда. Пожалуйста, попробуйте позже.")
+        logger.error(f"FatSecret API error: {str(e)}")
+        await update.message.reply_text(
+            "Сервис питания временно недоступен. Пожалуйста, попробуйте позже."
+        )
         return CHOOSE_ACTION
 
 
