@@ -1,27 +1,37 @@
-import sqlite3
 from datetime import datetime
 from dp import Database
 import os
+import requests
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes,
     filters, ConversationHandler
 )
+import logging
 
-# Загружаем токен из .env
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+
+# Загружаем токены из .env файла окружения
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
+FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
 
-# Инициализируем базу данных
+# Инициализация базы данных
 db = Database()
 
-# Константы для состояний
+# Константы для состояний пользователя
 GENDER, AGE, HEIGHT, WEIGHT, ACTIVITY_LEVEL = range(5)
+CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT, ENTER_INGREDIENTS = range(5, 9)
 
-# Состояния для подсчета калорий блюда
-CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_INGREDIENTS = range(5, 8)
-
+# Возможные уровни активности пользователя
 ACTIVITY_LEVELS = [
     "1. Малоподвижный образ жизни",
     "2. Лёгкие физические нагрузки, прогулки",
@@ -31,6 +41,7 @@ ACTIVITY_LEVELS = [
     "6. Профессиональный спорт (2+ тренировки в день)"
 ]
 
+# Факторы активности для расчета суточной нормы калорий
 ACTIVITY_FACTORS = {
     ACTIVITY_LEVELS[0]: 1.2,
     ACTIVITY_LEVELS[1]: 1.375,
@@ -40,19 +51,55 @@ ACTIVITY_FACTORS = {
     ACTIVITY_LEVELS[5]: 2.1
 }
 
-# Простая база калорийности продуктов (ккал на 100 г)
-PRODUCT_CALORIES = {
-    'рис': 130,
-    'курица жареная': 239,
-    'курица вареная': 165,
-    'грибы': 22,
-    'кола': 42,
-    'кола зеро': 0
-}
 
-user_soda_count = {}
+# --- Работа с FatSecret API ---
+def get_access_token():
+    """
+    Получение access_token с использованием Client Credentials Flow OAuth2.
+    Добавлена обработка ошибок.
+    """
+    url = "https://oauth.fatsecret.com/connect/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "grant_type": "client_credentials",
+        "scope": "basic",
+        "client_id": FATSECRET_CLIENT_ID,
+        "client_secret": FATSECRET_CLIENT_SECRET
+    }
+    try:
+        response = requests.post(url, headers=headers, data=data)
+        response.raise_for_status()
+        token_data = response.json()
+        if 'access_token' not in token_data:
+            logger.error(f"FatSecret API error: {token_data}")
+            raise ValueError("No access_token in response")
+        return token_data["access_token"]
+    except Exception as e:
+        logger.error(f"Error getting access token: {e}")
+        raise
 
-registration = False
+
+def search_food(query, token):
+    """
+    Выполняет поиск продуктов по текстовому запросу через FatSecret API.
+    Возвращает JSON с найденными продуктами.
+    """
+    url = "https://platform.fatsecret.com/rest/server.api"
+    params = {
+        "method": "foods.search",
+        "search_expression": query,
+        "format": "json"
+    }
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+    try:
+        response = requests.get(url, params=params, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.error(f"Error searching food: {e}")
+        raise
 
 
 # Обработчик команды /start
@@ -69,7 +116,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def choose_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if str(text) == "Регистрация" and registration == False:
+    user_data = context.user_data
+
+    # Проверяем, завершена ли регистрация
+    registration_complete = user_data.get('registration_complete', False)
+
+    if str(text) == "Регистрация" and not registration_complete:
         await update.message.reply_text(
             f"Чтобы помочь тебе, мне надо задать пару вопросов.\n"
             f"Пример ответа будет отображаться вот так: |Пример|"
@@ -83,7 +135,7 @@ async def choose_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Какое блюдо вы ели или готовите? Опишите кратко.")
         return ENTER_DISH_NAME
     else:
-        if registration:
+        if registration_complete:
             reply_keyboard = [["Подсчёт ккал блюда"]]
         else:
             reply_keyboard = [["Регистрация", "Подсчёт ккал блюда"]]
@@ -177,9 +229,6 @@ async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def activity_level_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global registration
-    registration = True
-
     activity = update.message.text
     if activity not in ACTIVITY_LEVELS:
         reply_keyboard = [
@@ -199,6 +248,7 @@ async def activity_level_handler(update: Update, context: ContextTypes.DEFAULT_T
         return ACTIVITY_LEVEL
 
     context.user_data['activity_level'] = activity
+    context.user_data['registration_complete'] = True
     await update.message.reply_text(f"✅ Ваш уровень активности: {activity[2:]}", reply_markup=ReplyKeyboardRemove())
 
     # Расчет и вывод результатов
@@ -254,53 +304,95 @@ async def activity_level_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 # Получение названия блюда
 async def enter_dish_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['dish_name'] = update.message.text
-    await update.message.reply_text(
-        "Введите ингредиенты и вес каждого в гр. или мл.\nПример: рис 200, курица жареная 150, грибы 50, кола зеро 330")
-    return ENTER_INGREDIENTS
+    """
+    Принимает от пользователя название продукта или блюда,
+    ищет его в FatSecret и предлагает ввести массу (в граммах).
+    """
+    query = update.message.text
+    context.user_data['dish_query'] = query
+
+    try:
+        token = get_access_token()
+        result = search_food(query, token)
+
+        if "foods" not in result or "food" not in result["foods"] or not result["foods"]["food"]:
+            await update.message.reply_text("❌ Не удалось найти информацию по блюду. Попробуйте другое название.")
+            return CHOOSE_ACTION
+
+        # Используем первый результат из поиска
+        food = result["foods"]["food"][0]
+        context.user_data['food'] = food
+
+        name = food["food_name"]
+        desc = food.get("food_description", "Нет описания")
+
+        await update.message.reply_text(
+            f"🔍 Найдено: {name}\nОписание: {desc}\n\n"
+            f"Введите вес продукта в граммах для расчета калорийности."
+        )
+        return ENTER_WEIGHT
+
+    except Exception as e:
+        logger.error(f"Error in enter_dish_name: {e}")
+        await update.message.reply_text("❌ Произошла ошибка при поиске блюда. Пожалуйста, попробуйте позже.")
+        return CHOOSE_ACTION
 
 
-# Расчет калорийности
-async def enter_ingredients(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    items = text.split(',')
-    total_calories = 0
-    soda_mentions = 0
+async def enter_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Принимает вес продукта от пользователя, извлекает калории из описания
+    и рассчитывает общую калорийность.
+    """
+    try:
+        grams = float(update.message.text.replace(',', '.'))  # Обрабатываем ввод с запятой
+        food = context.user_data.get('food')
+        if not food:
+            await update.message.reply_text("❌ Информация о блюде утеряна. Начните поиск заново.")
+            return CHOOSE_ACTION
 
-    for item in items:
-        parts = item.strip().rsplit(' ', 1)
-        if len(parts) != 2:
-            continue
-        name, grams = parts[0].lower(), parts[1]
-        try:
-            grams = float(grams)
-            cals_per_100 = 0
-            for key in PRODUCT_CALORIES:
-                if key in name:
-                    cals_per_100 = PRODUCT_CALORIES[key]
-                    if 'кола' in key:
-                        soda_mentions += 1
-                    break
-            total_calories += (cals_per_100 * grams) / 100
-        except:
-            continue
+        desc = food.get("food_description", "")
+        if "Calories:" not in desc:
+            await update.message.reply_text("❌ Не удалось получить информацию о калорийности. Попробуйте другое блюдо.")
+            return CHOOSE_ACTION
 
-    user_id = update.effective_user.id
-    user_soda_count[user_id] = user_soda_count.get(user_id, 0) + soda_mentions
+        # Пытаемся вычленить число калорий из текстового описания
+        calories_part = desc.split('Calories:')[-1].split('kcal')[0].strip()
+        cal_per_100g = float(calories_part)
 
-    msg = f"🍽️ Общая калорийность: {total_calories:.0f} ккал."
-    if user_soda_count[user_id] >= 3:
-        msg += "\n⚠️ Вы часто употребляете газировку. Это может быть вредно для здоровья."
+        total_calories = (cal_per_100g * grams) / 100
 
-    keyboard = [[KeyboardButton("Подсчёт ккал блюда")]]
-    await update.message.reply_text(msg)
-    await update.message.reply_text("Что дальше?", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-    return CHOOSE_ACTION
+        await update.message.reply_text(
+            f"🍽️ Калорийность {grams:.0f} г продукта: {total_calories:.0f} ккал."
+        )
+
+        # Показываем кнопку возврата к подсчету следующего блюда
+        keyboard = [[KeyboardButton("Подсчёт ккал блюда")]]
+        await update.message.reply_text("Что дальше?", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        return CHOOSE_ACTION
+
+    except ValueError:
+        await update.message.reply_text("Пожалуйста, введите число — массу продукта в граммах.")
+        return ENTER_WEIGHT
+    except Exception as e:
+        logger.error(f"Error in enter_weight: {e}")
+        await update.message.reply_text("❌ Произошла ошибка при расчете калорий. Пожалуйста, попробуйте снова.")
+        return CHOOSE_ACTION
+
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Логируем ошибки и уведомляем пользователя."""
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+
+    if update and update.message:
+        await update.message.reply_text("❌ Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже.")
 
 
 # Основная программа
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
+
+    # Добавляем обработчик ошибок
+    app.add_error_handler(error_handler)
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start), CommandHandler('profile', start)],
@@ -312,7 +404,7 @@ def main():
             WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, weight_handler)],
             ACTIVITY_LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, activity_level_handler)],
             ENTER_DISH_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_dish_name)],
-            ENTER_INGREDIENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_ingredients)],
+            ENTER_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_weight)],
         },
         fallbacks=[]
     )
