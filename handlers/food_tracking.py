@@ -80,7 +80,7 @@ class FoodTrackingHandler(BaseHandler):
         """Обработка веса продукта и расчет калорий"""
         try:
             weight = float(update.message.text.replace(',', '.'))
-            if weight <= 0 or weight > 5000:  # Реалистичные ограничения веса
+            if not 0 < weight < 5000:  # Реалистичные ограничения веса
                 raise ValueError
 
             food_item = context.user_data.get('current_food')
