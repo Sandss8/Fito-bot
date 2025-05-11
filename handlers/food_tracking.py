@@ -1,7 +1,7 @@
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ContextTypes, filters
 from config import Config
-from base import BaseHandler
+from handlers.base import BaseHandler
 from services.fatsecret import FatSecretAPI
 import logging
 

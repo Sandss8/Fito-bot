@@ -1,7 +1,7 @@
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ContextTypes
 from config import Config
-from base import BaseHandler
+from handlers.base import BaseHandler
 
 
 class StartHandler(BaseHandler):
