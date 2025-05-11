@@ -117,18 +117,15 @@ class BotController:
         reg_done = context.user_data.get('registration_complete', False)
 
         if reg_done:
-            keyboard = [["Подсчёт ккал блюда"]]
-            await update.message.reply_text(
-                "Выбери, что ты хочешь сделать?",
-                reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-            )
+            keyboard = [["Профиль", "Подсчёт ккал блюда"]]
+            hello_text = ''
         else:
             keyboard = [["Регистрация", "Подсчёт ккал блюда"]]
-            await update.message.reply_text(
-                f"Привет, {user_name}! Выбери, что ты хочешь сделать?",
-                reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-            )
-
+            hello_text = f'Привет, {user_name}! '
+        await update.message.reply_text(
+            f"{hello_text}Что ты хочешь сделать?",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        )
         return CHOOSE_ACTION
 
     async def choose_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -146,11 +143,33 @@ class BotController:
             await update.message.reply_text("Укажите ваш биологический пол:",
                                             reply_markup=ReplyKeyboardMarkup(reply_keyboard_gen,
                                                                              one_time_keyboard=True))
-
             return GENDER
         elif str(text) == "Подсчёт ккал блюда":
             await update.message.reply_text("Какое блюдо вы ели или готовите? Опишите кратко.")
             return ENTER_DISH_NAME
+        elif str(text) == "Профиль":
+            if not reg_done:
+                await update.message.reply_text(
+                    "Вы ещё не зарегистрированы. Пожалуйста, зарегистрируйтесь.",
+                    reply_markup=ReplyKeyboardMarkup([["Регистрация"]], one_time_keyboard=True)
+                )
+                return CHOOSE_ACTION
+
+            # вывод данных профиля
+            data = self.db.get_user_data(update.effective_user.id)
+            text = (
+                f"👤 Ваш профиль:\n"
+                f"• Пол: {data['gender']}\n"
+                f"• Возраст: {data['age']}\n"
+                f"• Рост: {data['height']} см\n"
+                f"• Вес: {data['weight']} кг\n"
+                f"• Активность: {data['activity_level'][2:]}\n"
+                f"• BMR: {data['bmr']:.0f} ккал\n"
+                f"• Норма: {data['daily_calories']:.0f} ккал\n"
+                f"• Зарегистрирован: {data['registration_date']}"
+            )
+            await update.message.reply_text(text)
+            return CHOOSE_ACTION
         else:
             await update.message.reply_text("Пожалуйста, используйте кнопки ниже:",
                                             reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True,
@@ -231,7 +250,7 @@ class BotController:
         sess = self._get_session(user_id)
 
         activity = update.message.text
-        if activity not in ACTIVITY_LEVELS:
+        if activity not in ACTIVITY_LEVELS and int(activity[0]) not in range(1, 7):
             reply_keyboard = [
                 [ACTIVITY_LEVELS[0]],
                 [ACTIVITY_LEVELS[1], ACTIVITY_LEVELS[2]],
@@ -247,6 +266,10 @@ class BotController:
                 )
             )
             return ACTIVITY_LEVEL
+
+        if activity.isdigit():
+            activity = ACTIVITY_LEVELS[int(activity) - 1]
+        self._get_session(update.effective_user.id).data["activity_level"] = activity  # Сохраняем активность
 
         # меню после регистрации
         await update.message.reply_text(
