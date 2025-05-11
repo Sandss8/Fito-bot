@@ -30,8 +30,12 @@ FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
 FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
 
 # ============ Константы для состояний ============
-GENDER, AGE, HEIGHT, WEIGHT, ACTIVITY_LEVEL = range(5)
-START, CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT = range(5, 9)
+(START, GENDER, AGE, HEIGHT, WEIGHT, ACTIVITY_LEVEL,
+ CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT,
+ ADD_DISH, DISH_SOURCE,
+ CUSTOM_NAME, CUSTOM_VOLUME_CHECK, CUSTOM_INGREDIENTS_WEIGHT, CUSTOM_INGREDIENTS_LIST, CUSTOM_RECIPE,
+ STORE_NAME, STORE_CALORIES
+ ) = range(18)
 
 ACTIVITY_LEVELS = [
     "1. Малоподвижный образ жизни",
@@ -41,52 +45,33 @@ ACTIVITY_LEVELS = [
     "5. Высокая активность 6-7 раз в неделю",
     "6. Профессиональный спорт (2+ тренировки в день)"
 ]
-ACTIVITY_FACTORS = {
-    ACTIVITY_LEVELS[0]: 1.2,
-    ACTIVITY_LEVELS[1]: 1.375,
-    ACTIVITY_LEVELS[2]: 1.55,
-    ACTIVITY_LEVELS[3]: 1.725,
-    ACTIVITY_LEVELS[4]: 1.9,
-    ACTIVITY_LEVELS[5]: 2.1
-}
+ACTIVITY_FACTORS = {level: factor for level, factor in zip(ACTIVITY_LEVELS, [1.2, 1.375, 1.55, 1.725, 1.9, 2.1])}
 
 
-# ============ Класс для работы с FatSecret API ============
+# ============ Класс для работы с OpenFoodFacts API ============
 class OpenFoodFactsAPI:
     SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
 
     def search_food(self, query: str) -> dict:
-        """
-        Ищет продукт по ключевым словам в OpenFoodFacts.
-        Возвращает JSON с первым подходящим продуктом.
-        """
-        params = {
-            "search_terms": query,
-            "search_simple": 1,
-            "action": "process",
-            "json": 1,
-            "page_size": 5
-        }
-        # Собираем URL
-        url = f"{self.SEARCH_URL}?{urllib.parse.urlencode(params)}"
-        resp = requests.get(url, timeout=5)
+        params = {"search_terms": query, "search_simple": 1,
+                  "action": "process", "json": 1, "page_size": 5}
+        resp = requests.get(self.SEARCH_URL, params=params, timeout=5)
         resp.raise_for_status()
-        data = resp.json()
-        if not data.get("products"):
+        data = resp.json().get("products", [])
+        if not data:
             raise ValueError("Не найдено продуктов")
-        return data["products"][0]  # берём первый продукт
+        return data[0]  # берём первый продукт
 
 
 # ============ Калькулятор BMR и калорий ============
 class CalorieCalculator:
     @staticmethod
-    def bmr(gender: str, weight: float, height: float, age: int) -> float:
-        return 10 * weight + 6.25 * height - 5 * age + (5 if gender == "М" else -161)
+    def bmr(g, w, h, a):
+        return 10 * w + 6.25 * h - 5 * a + (5 if g == "М" else -161)
 
     @staticmethod
-    def daily_calories(bmr_value: float, activity_level):
-        factor = ACTIVITY_FACTORS[f'{activity_level}']
-        return bmr_value * factor
+    def daily_calories(bmr, alvl):
+        return bmr * ACTIVITY_FACTORS[f'{alvl}']
 
 
 # ============ Сессия пользователя ============
@@ -117,7 +102,8 @@ class BotController:
         reg_done = context.user_data.get('registration_complete', False)
 
         if reg_done:
-            keyboard = [["Профиль", "Подсчёт ккал блюда"]]
+            keyboard = [["Профиль", "Добавить блюдо"],
+                        ["Подсчёт ккал блюда"]]
             hello_text = ''
         else:
             keyboard = [["Регистрация", "Подсчёт ккал блюда"]]
@@ -132,7 +118,6 @@ class BotController:
         text = update.message.text
         sess = self._get_session(update.effective_user.id)
         reg_done = context.user_data.get('registration_complete', False)
-        keyboard = [["Подсчёт ккал блюда"]] if reg_done else [["Регистрация", "Подсчёт ккал блюда"]]
         if str(text) == "Регистрация" and not reg_done:
             sess.clear()
             await update.message.reply_text(
@@ -171,9 +156,7 @@ class BotController:
             await update.message.reply_text(text)
             return CHOOSE_ACTION
         else:
-            await update.message.reply_text("Пожалуйста, используйте кнопки ниже:",
-                                            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True,
-                                                                             resize_keyboard=True))
+            await update.message.reply_text("Пожалуйста, используйте кнопки ниже:")
             return START
 
     # --- Регистрационные хендлеры ---
