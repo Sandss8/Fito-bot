@@ -3,7 +3,7 @@
 import os
 import logging
 from datetime import datetime
-
+import urllib.parse
 import requests
 from dotenv import load_dotenv
 from telegram import (
@@ -52,43 +52,29 @@ ACTIVITY_FACTORS = {
 
 
 # ============ Класс для работы с FatSecret API ============
-class FatSecretAPI:
-    TOKEN_URL = "https://oauth.fatsecret.com/connect/token"
-    BASE_URL = "https://platform.fatsecret.com/rest/server.api"
-
-    def __init__(self, client_id: str, client_secret: str):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self._token: str = ""
-
-    def _refresh_token(self):
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        data = {
-            "grant_type": "client_credentials",
-            "scope": "basic",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret
-        }
-        resp = requests.post(self.TOKEN_URL, headers=headers, data=data)
-        resp.raise_for_status()
-        payload = resp.json()
-        if "access_token" not in payload:
-            logger.error("FatSecret: no access_token in response %s", payload)
-            raise RuntimeError("FatSecret token error")
-        self._token = payload["access_token"]
+class OpenFoodFactsAPI:
+    SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
 
     def search_food(self, query: str) -> dict:
-        if not self._token:
-            self._refresh_token()
+        """
+        Ищет продукт по ключевым словам в OpenFoodFacts.
+        Возвращает JSON с первым подходящим продуктом.
+        """
         params = {
-            "method": "foods.search",
-            "search_expression": query,
-            "format": "json"
+            "search_terms": query,
+            "search_simple": 1,
+            "action": "process",
+            "json": 1,
+            "page_size": 5
         }
-        headers = {"Authorization": f"Bearer {self._token}"}
-        resp = requests.get(self.BASE_URL, params=params, headers=headers)
+        # Собираем URL
+        url = f"{self.SEARCH_URL}?{urllib.parse.urlencode(params)}"
+        resp = requests.get(url, timeout=5)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        if not data.get("products"):
+            raise ValueError("Не найдено продуктов")
+        return data["products"][0]  # берём первый продукт
 
 
 # ============ Калькулятор BMR и калорий ============
@@ -117,7 +103,7 @@ class BotController:
     def __init__(self):
         self.reply_keyboard = None
         self.db = Database()
-        self.api = FatSecretAPI(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET)
+        self.api = OpenFoodFactsAPI()
         self.calc = CalorieCalculator()
         self.sessions: dict[int, UserSession] = {}
 
@@ -296,52 +282,85 @@ class BotController:
         return await self.start(update, context)
 
     # --- Подсчёт калорий в блюде ---
-    async def enter_dish_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.message.text
-        sess = self._get_session(update.effective_user.id)
-        sess.data["dish_query"] = query
+    async def enter_dish_name(self, upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        query = upd.message.text
+        sess = self._get_session(upd.effective_user.id)
 
         try:
-            result = self.api.search_food(query)
-            foods = result.get("foods", {}).get("food", [])
-            if not foods:
-                raise ValueError("не найдено")
-            food = foods[0]
-            sess.data["food"] = food
-            await update.message.reply_text(
-                f"Нашёл: {food['food_name']}\nОписание: {food.get('food_description', '-')}\nВведите граммы:"
-            )
-            return ENTER_WEIGHT
-        except Exception:
-            return await update.message.reply_text("Ошибка поиска, попробуйте позже")
+            product = self.api.search_food(query)
+        except Exception as e:
+            logger.error("OFF API error: %s", e)
+            await upd.message.reply_text("Сервис OpenFoodFacts временно недоступен или ничего не найдено.")
+            return CHOOSE_ACTION
 
-    async def enter_weight(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        grams = float(update.message.text.replace(",", "."))
-        sess = self._get_session(update.effective_user.id)
-        food = sess.data.get("food", {})
-        desc = food.get("food_description", "")
-        if "Calories:" not in desc:
-            return await update.message.reply_text("Нет данных о калориях")
-        per100 = float(desc.split("Calories:")[-1].split("kcal")[0].strip())
-        total = per100 * grams / 100
-        await update.message.reply_text(f"{grams:.0f} г ≈ {total:.0f} ккал")
+        sess.data["food_name"] = product.get("product_name", "—")
+        nutr = product.get("nutriments", {})
+
+        # нутриенты на 100 г
+        sess.data["kcal_100g"] = nutr.get("energy-kcal_100g", 0)
+        sess.data["prot_100g"] = nutr.get("proteins_100g", 0)
+        sess.data["fat_100g"] = nutr.get("fat_100g", 0)
+        sess.data["carb_100g"] = nutr.get("carbohydrates_100g", 0)
+
+        await upd.message.reply_text(
+            f"🔍 Нашёл: {sess.data['food_name']}\n"
+            f"Калорийность: {sess.data['kcal_100g']:.0f} ккал/100 г\n"
+            f"Белки: {sess.data['prot_100g']:.1f} г, "
+            f"Жиры: {sess.data['fat_100g']:.1f} г, "
+            f"Угл.: {sess.data['carb_100g']:.1f} г\n\n"
+            "Введите вес в граммах для расчёта:"
+        )
+        return ENTER_WEIGHT
+
+    async def enter_weight(self, upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        text = upd.message.text.replace(",", ".")
+        sess = self._get_session(upd.effective_user.id)
+
+        try:
+            grams = float(text)
+        except ValueError:
+            await upd.message.reply_text("Пожалуйста, введите число в граммах.")
+            return ENTER_WEIGHT
+
+        # считаем пропорцию
+        kcal = sess.data["kcal_100g"] * grams / 100
+        prot = sess.data["prot_100g"] * grams / 100
+        fat = sess.data["fat_100g"] * grams / 100
+        carb = sess.data["carb_100g"] * grams / 100
+
+        await upd.message.reply_text(
+            f"{grams:.0f} г ≈ {kcal:.0f} ккал\n"
+            f"Белки: {prot:.1f} г, Жиры: {fat:.1f} г, Угл.: {carb:.1f} г"
+        )
 
         # сохраняем приём пищи
         meal = {
-            "food_name": food["food_name"],
-            "calories": total,
-            "protein": None, "fat": None, "carbs": None,
+            "food_name": sess.data["food_name"],
+            "calories": kcal,
+            "protein": prot,
+            "fat": fat,
+            "carbs": carb,
             "weight": grams
         }
-        self.db.save_meal(update.effective_user.id, meal)
+        self.db.save_meal(upd.effective_user.id, meal)
 
         kb = [[KeyboardButton("Подсчёт ккал блюда")]]
-        return await update.message.reply_text("Готово!", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        await upd.message.reply_text("Готово!", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        return CHOOSE_ACTION
 
-    async def error(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logger.exception("Handler error")
-        if update.message:
-            await update.message.reply_text("❌ Ошибка, попробуйте позже")
+    async def error(self, update: Update | None, context: ContextTypes.DEFAULT_TYPE):
+        # Логируем полную трассировку
+        logger.error("Uncaught exception", exc_info=context.error)
+
+        # Если update есть и у него есть message — отвечаем пользователю
+        if update is not None and getattr(update, "message", None):
+            try:
+                await update.message.reply_text(
+                    "❌ Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже."
+                )
+            except Exception as send_exc:
+                # Даже если не удалось отправить текст — просто логируем
+                logger.error("Failed to send error message to user: %s", send_exc)
 
     def run(self):
         app = ApplicationBuilder().token(TOKEN).build()
@@ -362,10 +381,15 @@ class BotController:
             fallbacks=[]
         )
 
+        async def reset(_):
+            await app.bot.delete_webhook(drop_pending_updates=True)
+
+        app.post_init = reset
+
         app.add_handler(conv)
         app.add_error_handler(self.error)
         print("Бот запущен")
-        app.run_polling()
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
