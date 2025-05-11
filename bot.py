@@ -1,37 +1,38 @@
-from datetime import datetime
-from database import Database
+# bot.py
+
 import os
+import logging
+from datetime import datetime
+
 import requests
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes,
-    filters, ConversationHandler
+from telegram import (
+    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 )
-import logging
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters, ConversationHandler
+)
 
-# Настройка логирования
+from database import Database
+
+# ============ Настройка логирования ============
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-
-# Загружаем токены из .env файла окружения
+# ============ Загрузка переменных окружения ============
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
 FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
 
-# Инициализация базы данных
-db = Database()
-
-# Константы для состояний пользователя
+# ============ Константы для состояний ============
 GENDER, AGE, HEIGHT, WEIGHT, ACTIVITY_LEVEL = range(5)
-CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT, ENTER_INGREDIENTS = range(5, 9)
+START, CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT = range(5, 9)
 
-# Возможные уровни активности пользователя
 ACTIVITY_LEVELS = [
     "1. Малоподвижный образ жизни",
     "2. Лёгкие физические нагрузки, прогулки",
@@ -40,8 +41,6 @@ ACTIVITY_LEVELS = [
     "5. Высокая активность 6-7 раз в неделю",
     "6. Профессиональный спорт (2+ тренировки в день)"
 ]
-
-# Факторы активности для расчета суточной нормы калорий
 ACTIVITY_FACTORS = {
     ACTIVITY_LEVELS[0]: 1.2,
     ACTIVITY_LEVELS[1]: 1.375,
@@ -52,372 +51,322 @@ ACTIVITY_FACTORS = {
 }
 
 
-# --- Работа с FatSecret API ---
-def get_access_token():
-    """
-    Получение access_token с использованием Client Credentials Flow OAuth2.
-    Добавлена обработка ошибок.
-    """
-    url = "https://oauth.fatsecret.com/connect/token"
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    data = {
-        "grant_type": "client_credentials",
-        "scope": "basic",
-        "client_id": FATSECRET_CLIENT_ID,
-        "client_secret": FATSECRET_CLIENT_SECRET
-    }
-    try:
-        response = requests.post(url, headers=headers, data=data)
-        response.raise_for_status()
-        token_data = response.json()
-        if 'access_token' not in token_data:
-            logger.error(f"FatSecret API error: {token_data}")
-            raise ValueError("No access_token in response")
-        return token_data["access_token"]
-    except Exception as e:
-        logger.error(f"Error getting access token: {e}")
-        raise
+# ============ Класс для работы с FatSecret API ============
+class FatSecretAPI:
+    TOKEN_URL = "https://oauth.fatsecret.com/connect/token"
+    BASE_URL = "https://platform.fatsecret.com/rest/server.api"
+
+    def __init__(self, client_id: str, client_secret: str):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self._token: str = ""
+
+    def _refresh_token(self):
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data = {
+            "grant_type": "client_credentials",
+            "scope": "basic",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret
+        }
+        resp = requests.post(self.TOKEN_URL, headers=headers, data=data)
+        resp.raise_for_status()
+        payload = resp.json()
+        if "access_token" not in payload:
+            logger.error("FatSecret: no access_token in response %s", payload)
+            raise RuntimeError("FatSecret token error")
+        self._token = payload["access_token"]
+
+    def search_food(self, query: str) -> dict:
+        if not self._token:
+            self._refresh_token()
+        params = {
+            "method": "foods.search",
+            "search_expression": query,
+            "format": "json"
+        }
+        headers = {"Authorization": f"Bearer {self._token}"}
+        resp = requests.get(self.BASE_URL, params=params, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
 
 
-def search_food(query, token):
-    """
-    Выполняет поиск продуктов по текстовому запросу через FatSecret API.
-    Возвращает JSON с найденными продуктами.
-    """
-    url = "https://platform.fatsecret.com/rest/server.api"
-    params = {
-        "method": "foods.search",
-        "search_expression": query,
-        "format": "json"
-    }
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
-    try:
-        response = requests.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        logger.error(f"Error searching food: {e}")
-        raise
+# ============ Калькулятор BMR и калорий ============
+class CalorieCalculator:
+    @staticmethod
+    def bmr(gender: str, weight: float, height: float, age: int) -> float:
+        return 10 * weight + 6.25 * height - 5 * age + (5 if gender == "М" else -161)
+
+    @staticmethod
+    def daily_calories(bmr_value: float, activity_level):
+        factor = ACTIVITY_FACTORS[f'{activity_level}']
+        return bmr_value * factor
 
 
-# Обработчик команды /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_name = update.message.chat.first_name
-    reply_keyboard = [["Регистрация", "Подсчёт ккал блюда"]]
-    await update.message.reply_text(
-        f"Привет, {user_name}! Выбери, что ты хочешь сделать?\n\n"
-        "Рекомендую для начала зарегистрироваться, чтобы подсчитать дневную норму ккал!",
-        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
-    )
-    return CHOOSE_ACTION
+# ============ Сессия пользователя ============
+class UserSession:
+    def __init__(self):
+        self.data: dict = {}
+
+    def clear(self):
+        self.data.clear()
 
 
-async def choose_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    user_data = context.user_data
+# ============ Основной контроллер бота ============
+class BotController:
+    def __init__(self):
+        self.reply_keyboard = None
+        self.db = Database()
+        self.api = FatSecretAPI(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET)
+        self.calc = CalorieCalculator()
+        self.sessions: dict[int, UserSession] = {}
 
-    # Проверяем, завершена ли регистрация
-    registration_complete = user_data.get('registration_complete', False)
+    def _get_session(self, user_id: int) -> UserSession:
+        if user_id not in self.sessions:
+            self.sessions[user_id] = UserSession()
+        return self.sessions[user_id]
 
-    if str(text) == "Регистрация" and not registration_complete:
-        await update.message.reply_text(
-            f"Чтобы помочь тебе, мне надо задать пару вопросов.\n"
-            f"Пример ответа будет отображаться вот так: |Пример|"
-        )
-        reply_keyboard = [["М", "Ж"]]
-        await update.message.reply_text("Укажите ваш биологический пол:",
-                                        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True))
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_name = update.effective_user.first_name
+        reg_done = context.user_data.get('registration_complete', False)
 
-        return GENDER
-    elif str(text) == "Подсчёт ккал блюда":
-        await update.message.reply_text("Какое блюдо вы ели или готовите? Опишите кратко.")
-        return ENTER_DISH_NAME
-    else:
-        if registration_complete:
-            reply_keyboard = [["Подсчёт ккал блюда"]]
+        if reg_done:
+            keyboard = [["Подсчёт ккал блюда"]]
+            await update.message.reply_text(
+                "Выбери, что ты хочешь сделать?",
+                reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+            )
         else:
-            reply_keyboard = [["Регистрация", "Подсчёт ккал блюда"]]
-        await update.message.reply_text("Пожалуйста, используйте кнопки ниже:",
-                                        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True))
+            keyboard = [["Регистрация", "Подсчёт ккал блюда"]]
+            await update.message.reply_text(
+                f"Привет, {user_name}! Выбери, что ты хочешь сделать?",
+                reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+            )
+
         return CHOOSE_ACTION
 
-
-# Обработчик сообщения с гендером
-async def gender_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gender = update.message.text.upper()
-    if str(gender) not in ['М', 'Ж']:
-        await update.message.reply_text(
-            "Пожалуйста, выберите пол, используя кнопки ниже:",
-            reply_markup=ReplyKeyboardMarkup([["М", "Ж"]], one_time_keyboard=True)
-        )
-        return GENDER
-
-    context.user_data['gender'] = gender
-    gender_text = "Мужской" if gender == "М" else "Женский"
-    await update.message.reply_text(f"✅ Ваш пол: {gender_text}", reply_markup=ReplyKeyboardRemove())
-
-    await update.message.reply_text("Введите ваш возраст (полных лет):\n| 25 |")
-    return AGE  # Переводим бота в состояние ожидания возраста
-
-
-# Обработчик сообщения с возрастом
-async def age_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        age = int(update.message.text)
-        if not 10 <= age <= 120:
-            raise ValueError
-        context.user_data['age'] = age
-        await update.message.reply_text(f"✅ Вам {age} лет")
-
-        await update.message.reply_text('Введите ваш рост в см \n| 175 |')
-        return HEIGHT  # Переводим бота в состояние ожидания роста
-    except ValueError:
-        await update.message.reply_text("Пожалуйста, введите корректное, целое число \n| 20 | (10-120)")
-        return AGE  # Остаемся в состоянии возраста
-
-
-# Обработчик сообщения с ростом
-async def height_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        height = int(update.message.text)
-        if not 100 <= height <= 250:
-            raise ValueError
-        context.user_data['height'] = height  # Сохраняем рост
-        await update.message.reply_text(f"✅ Ваш рост: {height} см")
-
-        await update.message.reply_text("Введите ваш вес в кг \n| 50 | 50,5 | 50.55 |")
-        return WEIGHT  # Переводим бота в состояние ожидания веса
-
-    except ValueError:
-        await update.message.reply_text("Пожалуйста, введите корректное, целое число  \n| 150 | (100-250)")
-        return HEIGHT  # Остаемся в состоянии роста
-
-
-# Обработчик сообщения с весом
-async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    weight = update.message.text
-    try:
-        weight = float(str(weight).replace(',', '.'))
-        if not 30 <= weight <= 300:
-            raise ValueError
-        context.user_data['weight'] = weight  # Сохраняем вес
-        await update.message.reply_text(f"✅ Ваш вес: {weight} кг")
-
-        # Создаем клавиатуру с уровнями активности
-        reply_keyboard = [
-            [ACTIVITY_LEVELS[0]],  # Первый уровень - отдельная строка
-            [ACTIVITY_LEVELS[1], ACTIVITY_LEVELS[2]],  # Вторая строка - 2 кнопки
-            [ACTIVITY_LEVELS[3], ACTIVITY_LEVELS[4]],  # Третья строка - 2 кнопки
-            [ACTIVITY_LEVELS[5]]  # Последний уровень - отдельная строка
-        ]
-
-        await update.message.reply_text(
-            "Выберите уровень физической активности:",
-            reply_markup=ReplyKeyboardMarkup(
-                reply_keyboard,
-                one_time_keyboard=True,  # Клавиатура скроется после выбора
-                resize_keyboard=True  # Кнопки подстроятся под размер
+    async def choose_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text
+        sess = self._get_session(update.effective_user.id)
+        reg_done = context.user_data.get('registration_complete', False)
+        keyboard = [["Подсчёт ккал блюда"]] if reg_done else [["Регистрация", "Подсчёт ккал блюда"]]
+        if str(text) == "Регистрация" and not reg_done:
+            sess.clear()
+            await update.message.reply_text(
+                f"Чтобы помочь тебе, мне надо задать пару вопросов.\n"
+                f"Пример ответа будет отображаться вот так: |Пример|"
             )
-        )
-        return ACTIVITY_LEVEL
+            reply_keyboard_gen = [["М", "Ж"]]
+            await update.message.reply_text("Укажите ваш биологический пол:",
+                                            reply_markup=ReplyKeyboardMarkup(reply_keyboard_gen,
+                                                                             one_time_keyboard=True))
 
-    except ValueError:
-        await update.message.reply_text("Пожалуйста, введите корректный вес \n| 70 | 70,5 | 70.55 | (30-300)")
-        return WEIGHT  # Остаемся в состоянии веса
+            return GENDER
+        elif str(text) == "Подсчёт ккал блюда":
+            await update.message.reply_text("Какое блюдо вы ели или готовите? Опишите кратко.")
+            return ENTER_DISH_NAME
+        else:
+            await update.message.reply_text("Пожалуйста, используйте кнопки ниже:",
+                                            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True,
+                                                                             resize_keyboard=True))
+            return START
 
-
-async def activity_level_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    activity = update.message.text
-    if activity not in ACTIVITY_LEVELS:
-        reply_keyboard = [
-            [ACTIVITY_LEVELS[0]],
-            [ACTIVITY_LEVELS[1], ACTIVITY_LEVELS[2]],
-            [ACTIVITY_LEVELS[3], ACTIVITY_LEVELS[4]],
-            [ACTIVITY_LEVELS[5]]
-        ]
-        await update.message.reply_text(
-            "Пожалуйста, выберите уровень активности из предложенных:",
-            reply_markup=ReplyKeyboardMarkup(
-                reply_keyboard,
-                one_time_keyboard=True,
-                resize_keyboard=True
+    # --- Регистрационные хендлеры ---
+    async def gender(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        gender = update.message.text.upper()
+        if str(gender) not in ['М', 'Ж']:
+            await update.message.reply_text(
+                "Пожалуйста, выберите пол, используя кнопки ниже:",
+                reply_markup=ReplyKeyboardMarkup([["М", "Ж"]], one_time_keyboard=True)
             )
-        )
-        return ACTIVITY_LEVEL
+            return GENDER
+        self._get_session(update.effective_user.id).data["gender"] = gender
+        await update.message.reply_text("Введите ваш возраст (полных лет):\n| 25 |")
+        return AGE  # Переводим бота в состояние ожидания возраста
 
-    context.user_data['activity_level'] = activity
-    context.user_data['registration_complete'] = True
-    await update.message.reply_text(f"✅ Ваш уровень активности: {activity[2:]}", reply_markup=ReplyKeyboardRemove())
+    async def age(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            age = int(update.message.text)
+            if not 10 <= age <= 120:
+                raise ValueError
+            self._get_session(update.effective_user.id).data["age"] = age
 
-    # Расчет и вывод результатов
-    weight = context.user_data['weight']
-    height = context.user_data['height']
-    age = context.user_data['age']
-    gender = context.user_data['gender']
-    activity_factor = ACTIVITY_FACTORS[activity]
+            await update.message.reply_text('Введите ваш рост в см \n| 175 |')
+            return HEIGHT  # Переводим бота в состояние ожидания роста
+        except ValueError:
+            await update.message.reply_text("Пожалуйста, введите корректное, целое число \n| 20 | (10-120)")
+            return AGE  # Остаемся в состоянии возраста
 
-    # Формула Миффлина-Сан Жеора
-    if gender == "М":
-        bmr = (10 * weight) + (6.25 * height) - (5 * age) + 5
-    else:
-        bmr = (10 * weight) + (6.25 * height) - (5 * age) - 161
+    async def height(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            height = int(update.message.text)
+            if not 100 <= height <= 250:
+                raise ValueError
+            self._get_session(update.effective_user.id).data["height"] = height  # Сохраняем рост
 
-    daily_calories = bmr * activity_factor
+            await update.message.reply_text("Введите ваш вес в кг \n| 50 | 50,5 | 50.55 |")
+            return WEIGHT  # Переводим бота в состояние ожидания веса
 
-    await update.message.reply_text(
-        "📊 Результаты расчета:\n\n"
-        f"🔹 Основной обмен: {bmr:.0f} ккал/день\n"
-        f"🔹 С учетом активности: {daily_calories:.0f} ккал/день\n\n"
-        "Это примерная норма для поддержания текущего веса."
-    )
+        except ValueError:
+            await update.message.reply_text("Пожалуйста, введите корректное, целое число  \n| 150 | (100-250)")
+            return HEIGHT  # Остаемся в состоянии роста
 
-    # Подготавливаем данные для сохранения
-    user_data = {
-        'user_id': update.message.chat.id,
-        'username': update.message.chat.username,
-        'first_name': update.message.chat.first_name,
-        'last_name': update.message.chat.last_name,
-        'gender': gender,
-        'age': age,
-        'height': height,
-        'weight': weight,
-        'activity_level': activity,
-        'bmr': bmr,
-        'daily_calories': daily_calories,
-        'registration_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
+    async def weight(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            weight = float(update.message.text.replace(",", "."))
+            if not 30 <= weight <= 300:
+                raise ValueError
+            self._get_session(update.effective_user.id).data["weight"] = weight  # Сохраняем вес
 
-    # Сохраняем данные через наш класс Database
-    db.save_user_data(user_data)
+            # Создаем клавиатуру с уровнями активности
+            reply_keyboard = [
+                [ACTIVITY_LEVELS[0]],  # Первый уровень - отдельная строка
+                [ACTIVITY_LEVELS[1], ACTIVITY_LEVELS[2]],  # Вторая строка - 2 кнопки
+                [ACTIVITY_LEVELS[3], ACTIVITY_LEVELS[4]],  # Третья строка - 2 кнопки
+                [ACTIVITY_LEVELS[5]]  # Последний уровень - отдельная строка
+            ]
 
-    # Показать меню после расчета
-    reply_keyboard = [["Подсчёт ккал блюда"]]
-    await update.message.reply_text(
-        "Что дальше хочешь сделать?",
-        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
-    )
+            await update.message.reply_text(
+                "Выберите уровень физической активности:",
+                reply_markup=ReplyKeyboardMarkup(
+                    reply_keyboard,
+                    one_time_keyboard=True,  # Клавиатура скроется после выбора
+                    resize_keyboard=True  # Кнопки подстроятся под размер
+                )
+            )
+            return ACTIVITY_LEVEL
 
-    return CHOOSE_ACTION
+        except ValueError:
+            await update.message.reply_text("Пожалуйста, введите корректный вес \n| 70 | 70,5 | 70.55 | (30-300)")
+            return WEIGHT  # Остаемся в состоянии веса
 
+    async def activity_level(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        sess = self._get_session(user_id)
 
-# Получение названия блюда
-async def enter_dish_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Принимает от пользователя название продукта или блюда,
-    ищет его в FatSecret и предлагает ввести массу (в граммах).
-    """
-    query = update.message.text
-    context.user_data['dish_query'] = query
+        activity = update.message.text
+        if activity not in ACTIVITY_LEVELS:
+            reply_keyboard = [
+                [ACTIVITY_LEVELS[0]],
+                [ACTIVITY_LEVELS[1], ACTIVITY_LEVELS[2]],
+                [ACTIVITY_LEVELS[3], ACTIVITY_LEVELS[4]],
+                [ACTIVITY_LEVELS[5]]
+            ]
+            await update.message.reply_text(
+                "Пожалуйста, выберите уровень активности из предложенных:",
+                reply_markup=ReplyKeyboardMarkup(
+                    reply_keyboard,
+                    one_time_keyboard=True,
+                    resize_keyboard=True
+                )
+            )
+            return ACTIVITY_LEVEL
 
-    try:
-        token = get_access_token()
-        result = search_food(query, token)
-
-        if "foods" not in result or "food" not in result["foods"] or not result["foods"]["food"]:
-            await update.message.reply_text("❌ Не удалось найти информацию по блюду. Попробуйте другое название.")
-            return CHOOSE_ACTION
-
-        # Используем первый результат из поиска
-        food = result["foods"]["food"][0]
-        context.user_data['food'] = food
-
-        name = food["food_name"]
-        desc = food.get("food_description", "Нет описания")
-
+        # меню после регистрации
         await update.message.reply_text(
-            f"🔍 Найдено: {name}\nОписание: {desc}\n\n"
-            f"Введите вес продукта в граммах для расчета калорийности."
+            "✅ Регистрация завершена!",
+            reply_markup=ReplyKeyboardRemove()
         )
-        return ENTER_WEIGHT
+        context.user_data['registration_complete'] = True
 
-    except Exception as e:
-        logger.error(f"FatSecret API error: {str(e)}")
+        # считаем
+        bmr_val = self.calc.bmr(
+            sess.data["gender"], sess.data["weight"], sess.data["height"], sess.data["age"]
+        )
+        dc = self.calc.daily_calories(bmr_val, activity)
         await update.message.reply_text(
-            "Сервис питания временно недоступен. Пожалуйста, попробуйте позже."
+            "📊 Результаты расчета:\n\n"
+            f"🔹 Основной обмен: {bmr_val:.0f} ккал/день\n"
+            f"🔹 С учетом активности: {dc:.0f} ккал/день\n\n"
+            "Это примерная норма для поддержания текущего веса."
         )
-        return CHOOSE_ACTION
 
+        # сохраняем в бд
+        user_data = {
+            "user_id": user_id,
+            "username": update.effective_user.username,
+            "first_name": update.effective_user.first_name,
+            "last_name": update.effective_user.last_name,
+            **sess.data,
+            "bmr": bmr_val,
+            "daily_calories": dc,
+            "registration_date": datetime.now().isoformat(sep=" ", timespec="seconds")
+        }
+        self.db.save_user_data(user_data)
+        return await self.start(update, context)
 
-async def enter_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Принимает вес продукта от пользователя, извлекает калории из описания
-    и рассчитывает общую калорийность.
-    """
-    try:
-        grams = float(update.message.text.replace(',', '.'))  # Обрабатываем ввод с запятой
-        food = context.user_data.get('food')
-        if not food:
-            await update.message.reply_text("❌ Информация о блюде утеряна. Начните поиск заново.")
-            return CHOOSE_ACTION
+    # --- Подсчёт калорий в блюде ---
+    async def enter_dish_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.message.text
+        sess = self._get_session(update.effective_user.id)
+        sess.data["dish_query"] = query
 
+        try:
+            result = self.api.search_food(query)
+            foods = result.get("foods", {}).get("food", [])
+            if not foods:
+                raise ValueError("не найдено")
+            food = foods[0]
+            sess.data["food"] = food
+            await update.message.reply_text(
+                f"Нашёл: {food['food_name']}\nОписание: {food.get('food_description', '-')}\nВведите граммы:"
+            )
+            return ENTER_WEIGHT
+        except Exception:
+            return await update.message.reply_text("Ошибка поиска, попробуйте позже")
+
+    async def enter_weight(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        grams = float(update.message.text.replace(",", "."))
+        sess = self._get_session(update.effective_user.id)
+        food = sess.data.get("food", {})
         desc = food.get("food_description", "")
         if "Calories:" not in desc:
-            await update.message.reply_text("❌ Не удалось получить информацию о калорийности. Попробуйте другое блюдо.")
-            return CHOOSE_ACTION
+            return await update.message.reply_text("Нет данных о калориях")
+        per100 = float(desc.split("Calories:")[-1].split("kcal")[0].strip())
+        total = per100 * grams / 100
+        await update.message.reply_text(f"{grams:.0f} г ≈ {total:.0f} ккал")
 
-        # Пытаемся вычленить число калорий из текстового описания
-        calories_part = desc.split('Calories:')[-1].split('kcal')[0].strip()
-        cal_per_100g = float(calories_part)
+        # сохраняем приём пищи
+        meal = {
+            "food_name": food["food_name"],
+            "calories": total,
+            "protein": None, "fat": None, "carbs": None,
+            "weight": grams
+        }
+        self.db.save_meal(update.effective_user.id, meal)
 
-        total_calories = (cal_per_100g * grams) / 100
+        kb = [[KeyboardButton("Подсчёт ккал блюда")]]
+        return await update.message.reply_text("Готово!", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
-        await update.message.reply_text(
-            f"🍽️ Калорийность {grams:.0f} г продукта: {total_calories:.0f} ккал."
+    async def error(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.exception("Handler error")
+        if update.message:
+            await update.message.reply_text("❌ Ошибка, попробуйте позже")
+
+    def run(self):
+        app = ApplicationBuilder().token(TOKEN).build()
+
+        conv = ConversationHandler(
+            entry_points=[CommandHandler("start", self.start)],
+            states={
+                START: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.start)],
+                CHOOSE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.choose_action)],
+                GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.gender)],
+                AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.age)],
+                HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.height)],
+                WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.weight)],
+                ACTIVITY_LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.activity_level)],
+                ENTER_DISH_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_dish_name)],
+                ENTER_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_weight)],
+            },
+            fallbacks=[]
         )
 
-        # Показываем кнопку возврата к подсчету следующего блюда
-        keyboard = [[KeyboardButton("Подсчёт ккал блюда")]]
-        await update.message.reply_text("Что дальше?", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-        return CHOOSE_ACTION
-
-    except ValueError:
-        await update.message.reply_text("Пожалуйста, введите число — массу продукта в граммах.")
-        return ENTER_WEIGHT
-    except Exception as e:
-        logger.error(f"Error in enter_weight: {e}")
-        await update.message.reply_text("❌ Произошла ошибка при расчете калорий. Пожалуйста, попробуйте снова.")
-        return CHOOSE_ACTION
-
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Логируем ошибки и уведомляем пользователя."""
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-
-    if update and update.message:
-        await update.message.reply_text("❌ Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже.")
-
-
-# Основная программа
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # Добавляем обработчик ошибок
-    app.add_error_handler(error_handler)
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start), CommandHandler('profile', start)],
-        states={
-            CHOOSE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_action)],
-            GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, gender_handler)],
-            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, age_handler)],
-            HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, height_handler)],
-            WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, weight_handler)],
-            ACTIVITY_LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, activity_level_handler)],
-            ENTER_DISH_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_dish_name)],
-            ENTER_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_weight)],
-        },
-        fallbacks=[]
-    )
-
-    app.add_handler(conv_handler)
-
-    print("Бот запущен...")
-    app.run_polling()
+        app.add_handler(conv)
+        app.add_error_handler(self.error)
+        print("Бот запущен")
+        app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
-
-    # return ConversationHandler.END  # Завершаем диалог
+    BotController().run()
