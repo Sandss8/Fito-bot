@@ -1,5 +1,6 @@
 import os
 import logging
+from database import Database
 from datetime import datetime
 import requests
 from dotenv import load_dotenv
@@ -89,11 +90,9 @@ class YandexGPTAPI:
             result = response.json()
             return result['result']['alternatives'][0]['message']['text']
 
-
         except Exception as e:
             logger.error(f"YandexGPT API error: {e}")
             return "Извините, произошла ошибка при обработке вашего запроса."
-
 
 
 # ============ Класс для работы с FatSecret API ============
@@ -161,7 +160,7 @@ class UserSession:
 class BotController:
     def __init__(self):
         self.reply_keyboard = None
-        self.db = None  # Замените на вашу реализацию Database
+        self.db = Database()
         self.fatsecret_api = FatSecretAPI(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET)
         self.yandex_gpt = YandexGPTAPI(YANDEX_API_KEY, YANDEX_FOLDER_ID)
         self.calc = CalorieCalculator()
@@ -176,19 +175,18 @@ class BotController:
         user_name = update.effective_user.first_name
         reg_done = context.user_data.get('registration_complete', False)
 
-        keyboard = [
-            ["Подсчёт ккал блюда"],
-            ["Чат с AI"]
-        ]
-
-        if not reg_done:
-            keyboard.insert(0, ["Регистрация"])
-
+        if reg_done:
+            keyboard = [["Профиль", "Подсчёт ккал блюда"],
+                        ["AI подсчёт ккал"]]
+            hello_text = ''
+        else:
+            keyboard = [["Регистрация", "Подсчёт ккал блюда"],
+                        ["AI подсчёт ккал"]]
+            hello_text = f'Привет, {user_name}! '
         await update.message.reply_text(
-            f"Привет, {user_name}! Выбери, что ты хочешь сделать?",
-            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+            f"{hello_text}Что ты хочешь сделать?",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         )
-
         return CHOOSE_ACTION
 
     async def choose_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,28 +207,45 @@ class BotController:
             return GENDER
 
         elif text == "Подсчёт ккал блюда":
-            await update.message.reply_text("Какое блюдо вы ели или готовите? Опишите кратко.")
-            return ENTER_DISH_NAME
+            # await update.message.reply_text("Какое блюдо вы ели или готовите? Опишите кратко.")
+            # return ENTER_DISH_NAME
+            await update.message.reply_text("Сервис в разработке...")
+            return CHOOSE_ACTION
 
-        elif text == "Чат с AI":
-            await update.message.reply_text(
-                "Вы перешли в режим чата с AI. Задайте ваш вопрос:\n\n"
-                "Чтобы выйти из этого режима, отправьте /cancel",
-                reply_markup=ReplyKeyboardRemove()
+        elif str(text) == "Профиль":
+            if not reg_done:
+                await update.message.reply_text(
+                    "Вы ещё не зарегистрированы. Пожалуйста, зарегистрируйтесь.",
+                    reply_markup=ReplyKeyboardMarkup([["Регистрация"]], one_time_keyboard=True)
+                )
+                return CHOOSE_ACTION
+
+            # вывод данных профиля
+            data = self.db.get_user_data(update.effective_user.id)
+            text = (
+                f"👤 Ваш профиль:\n"
+                f"• Пол: {data['gender']}\n"
+                f"• Возраст: {data['age']}\n"
+                f"• Рост: {data['height']} см\n"
+                f"• Вес: {data['weight']} кг\n"
+                f"• Активность: {data['activity_level'][2:]}\n"
+                f"• BMR: {data['bmr']:.0f} ккал\n"
+                f"• Норма: {data['daily_calories']:.0f} ккал\n"
+                f"• Зарегистрирован: {data['registration_date']}"
             )
+            await update.message.reply_text(text)
+            return CHOOSE_ACTION
+
+        elif text == "AI подсчёт ккал":
+            await update.message.reply_text("Вы перешли в режим чата с AI. Задайте ваш вопрос:\n\n",
+                                            reply_markup=ReplyKeyboardRemove())
+            await update.message.reply_text("Чтобы выйти из этого режима, отправьте /cancel или нажмите на кнопку",
+                                            reply_markup=ReplyKeyboardMarkup([["/cancel"]], one_time_keyboard=True,
+                                                                             resize_keyboard=True))
             return CHAT_WITH_AI
 
         else:
-            keyboard = [
-                ["Подсчёт ккал блюда"],
-                ["Чат с AI"]
-            ]
-            if not reg_done:
-                keyboard.insert(0, ["Регистрация"])
-
-            await update.message.reply_text("Пожалуйста, используйте кнопки ниже:",
-                                            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True,
-                                                                             resize_keyboard=True))
+            await update.message.reply_text("Пожалуйста, используйте кнопки ниже:")
             return START
 
     async def gender(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -301,7 +316,7 @@ class BotController:
         sess = self._get_session(user_id)
 
         activity = update.message.text
-        if activity not in ACTIVITY_LEVELS:
+        if activity not in ACTIVITY_LEVELS and int(activity[0]) not in range(1, 7):
             reply_keyboard = [
                 [ACTIVITY_LEVELS[0]],
                 [ACTIVITY_LEVELS[1], ACTIVITY_LEVELS[2]],
@@ -317,6 +332,10 @@ class BotController:
                 )
             )
             return ACTIVITY_LEVEL
+
+        if activity.isdigit():
+            activity = ACTIVITY_LEVELS[int(activity) - 1]
+        self._get_session(update.effective_user.id).data["activity_level"] = activity  # Сохраняем активность
 
         await update.message.reply_text(
             "✅ Регистрация завершена!",
@@ -345,7 +364,7 @@ class BotController:
             "daily_calories": dc,
             "registration_date": datetime.now().isoformat(sep=" ", timespec="seconds")
         }
-        # self.db.save_user_data(user_data)  # Раскомментируйте, если реализуете базу данных
+        self.db.save_user_data(user_data)
         return await self.start(update, context)
 
     async def enter_dish_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -365,7 +384,8 @@ class BotController:
             )
             return ENTER_WEIGHT
         except Exception:
-            return await update.message.reply_text("Ошибка поиска, попробуйте позже")
+            await update.message.reply_text("Ошибка поиска, попробуйте позже")
+            return START
 
     async def enter_weight(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         grams = float(update.message.text.replace(",", "."))
@@ -378,13 +398,13 @@ class BotController:
         total = per100 * grams / 100
         await update.message.reply_text(f"{grams:.0f} г ≈ {total:.0f} ккал")
 
-        # meal = {
-        #     "food_name": food["food_name"],
-        #     "calories": total,
-        #     "protein": None, "fat": None, "carbs": None,
-        #     "weight": grams
-        # }
-        # self.db.save_meal(update.effective_user.id, meal)  # Раскомментируйте, если реализуете базу данных
+        meal = {
+            "food_name": food["food_name"],
+            "calories": total,
+            "protein": None, "fat": None, "carbs": None,
+            "weight": grams
+        }
+        self.db.save_meal(update.effective_user.id, meal)  # Раскомментируйте, если реализуете базу данных
 
         kb = [[KeyboardButton("Подсчёт ккал блюда")]]
         return await update.message.reply_text("Готово!", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
@@ -392,12 +412,9 @@ class BotController:
     async def chat_with_ai(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_message = update.message.text
 
-        if user_message.lower() in ['/cancel', 'отмена', 'выход']:
+        if user_message.lower() in ["/cancel", "Выйти из AI"]:
             await update.message.reply_text(
-                "Вы вышли из режима чата с AI.",
-                reply_markup=ReplyKeyboardMarkup([["Подсчёт ккал блюда"], ["Чат с AI"]],
-                                                 resize_keyboard=True)
-            )
+                "Вы вышли из режима чата с AI.")
             return START
 
         ai_response = await self.yandex_gpt.get_response(user_message)
