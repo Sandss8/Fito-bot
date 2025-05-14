@@ -32,7 +32,7 @@ IMAGE_RECIPES_DIR = os.getenv("IMAGE_RECIPES_DIR", "image_recipes")
 
 # ============ Константы для состояний ============
 GENDER, AGE, HEIGHT, WEIGHT, ACTIVITY_LEVEL = range(5)
-CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT, CHAT_WITH_AI = range(5, 9)
+START, CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT, CHAT_WITH_AI = range(5, 10)
 
 ACTIVITY_LEVELS = [
     "1. Малоподвижный образ жизни",
@@ -462,6 +462,7 @@ class BotController:
         conv = ConversationHandler(
             entry_points=[CommandHandler("start", self.start)],
             states={
+                START: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.start)],
                 CHOOSE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.choose_action)],
                 GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.gender)],
                 AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.age)],
