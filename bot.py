@@ -4,8 +4,10 @@ from database import Database
 from datetime import datetime
 import requests
 from dotenv import load_dotenv
+import random
+from PIL import Image
 from telegram import (
-    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InputFile
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -26,10 +28,11 @@ FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
 FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY")  # Ключ для Yandex Cloud API
 YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")  # ID каталога в Yandex Cloud
+IMAGE_RECIPES_DIR = os.getenv("IMAGE_RECIPES_DIR", "image_recipes")
 
 # ============ Константы для состояний ============
 GENDER, AGE, HEIGHT, WEIGHT, ACTIVITY_LEVEL = range(5)
-START, CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT, CHAT_WITH_AI = range(5, 10)
+CHOOSE_ACTION, ENTER_DISH_NAME, ENTER_WEIGHT, CHAT_WITH_AI = range(5, 9)
 
 ACTIVITY_LEVELS = [
     "1. Малоподвижный образ жизни",
@@ -39,17 +42,10 @@ ACTIVITY_LEVELS = [
     "5. Высокая активность 6-7 раз в неделю",
     "6. Профессиональный спорт (2+ тренировки в день)"
 ]
-ACTIVITY_FACTORS = {
-    ACTIVITY_LEVELS[0]: 1.2,
-    ACTIVITY_LEVELS[1]: 1.375,
-    ACTIVITY_LEVELS[2]: 1.55,
-    ACTIVITY_LEVELS[3]: 1.725,
-    ACTIVITY_LEVELS[4]: 1.9,
-    ACTIVITY_LEVELS[5]: 2.1
-}
+ACTIVITY_FACTORS = {lvl: factor for lvl, factor in zip(ACTIVITY_LEVELS, [1.2, 1.375, 1.55, 1.725, 1.9, 2.1])}
 
 
-# ============ Класс для работы с DeepSeek API ============
+# ============ Класс для работы с YandexGPT API ============
 class YandexGPTAPI:
     API_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
@@ -159,7 +155,6 @@ class UserSession:
 # ============ Основной контроллер бота ============
 class BotController:
     def __init__(self):
-        self.reply_keyboard = None
         self.db = Database()
         self.fatsecret_api = FatSecretAPI(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET)
         self.yandex_gpt = YandexGPTAPI(YANDEX_API_KEY, YANDEX_FOLDER_ID)
@@ -174,15 +169,16 @@ class BotController:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_name = update.effective_user.first_name
         reg_done = context.user_data.get('registration_complete', False)
+        first_run = context.user_data.get('first_run', False)
 
-        if reg_done:
-            keyboard = [["Профиль", "Подсчёт ккал блюда"],
-                        ["AI подсчёт ккал"]]
+        if first_run:
             hello_text = ''
         else:
-            keyboard = [["Регистрация", "Подсчёт ккал блюда"],
-                        ["AI подсчёт ккал"]]
             hello_text = f'Привет, {user_name}! '
+            context.user_data['first_run'] = True
+        keyboard = [["Профиль", "Подсчёт ккал блюда", "Ежедневный рецепт"],
+                    ["AI подсчёт ккал"]] if reg_done else [["Регистрация", "Подсчёт ккал блюда", "Ежедневный рецепт"],
+                                                           ["AI подсчёт ккал"]]
         await update.message.reply_text(
             f"{hello_text}Что ты хочешь сделать?",
             reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -234,7 +230,10 @@ class BotController:
                 f"• Зарегистрирован: {data['registration_date']}"
             )
             await update.message.reply_text(text)
-            return CHOOSE_ACTION
+            return await self.start(update, context)
+
+        elif text == "Ежедневный рецепт":
+            return await self.send_daily_recipe(update, context)
 
         elif text == "AI подсчёт ккал":
             await update.message.reply_text("Вы перешли в режим чата с AI. Задайте ваш вопрос:\n\n",
@@ -246,7 +245,7 @@ class BotController:
 
         else:
             await update.message.reply_text("Пожалуйста, используйте кнопки ниже:")
-            return START
+            return await self.start(update, context)
 
     async def gender(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         gender = update.message.text.upper()
@@ -385,7 +384,7 @@ class BotController:
             return ENTER_WEIGHT
         except Exception:
             await update.message.reply_text("Ошибка поиска, попробуйте позже")
-            return START
+            return await self.start(update, context)
 
     async def enter_weight(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         grams = float(update.message.text.replace(",", "."))
@@ -412,14 +411,45 @@ class BotController:
     async def chat_with_ai(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_message = update.message.text
 
-        if user_message.lower() in ["/cancel", "Выйти из AI"]:
-            await update.message.reply_text(
-                "Вы вышли из режима чата с AI.")
-            return START
-
         ai_response = await self.yandex_gpt.get_response(user_message)
         await update.message.reply_text(ai_response, parse_mode="Markdown")
         return CHAT_WITH_AI
+
+    async def send_daily_recipe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            # Абсолютный путь и содержимое директории
+            abs_dir = os.path.abspath(IMAGE_RECIPES_DIR)
+            logger.info(f"Looking in {abs_dir}")
+            files = [f for f in os.listdir(abs_dir)
+                     if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            logger.info(f"Found recipe images: {files}")
+            if not files:
+                await update.message.reply_text("Рецепты недоступны.")
+                return CHOOSE_ACTION
+
+            choice = random.choice(files)
+            src_path = os.path.join(abs_dir, choice)
+            logger.info(f"Selected image: {src_path}")
+
+            # Проверка валидности и конвертация в RGB JPEG
+            with Image.open(src_path) as img:
+                img.verify()  # проверка
+            with Image.open(src_path) as img:
+                safe_img = img.convert('RGB')
+                temp_path = os.path.join(abs_dir, f"safe_{choice}.jpg")
+                safe_img.save(temp_path, 'JPEG')
+
+            # Отправка файла
+            with open(temp_path, 'rb') as f:
+                data = f.read()
+            await update.message.reply_photo(photo=data, caption="🍴 Ваш ежедневный рецепт")
+            # Опционально удалить временный
+            os.remove(temp_path)
+
+        except Exception as e:
+            logger.error(f"Error sending recipe image: {e}", exc_info=True)
+            await update.message.reply_text("Ошибка при отправке рецепта.")
+        return CHOOSE_ACTION
 
     async def error(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Handler error")
@@ -432,7 +462,6 @@ class BotController:
         conv = ConversationHandler(
             entry_points=[CommandHandler("start", self.start)],
             states={
-                START: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.start)],
                 CHOOSE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.choose_action)],
                 GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.gender)],
                 AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.age)],
@@ -448,6 +477,7 @@ class BotController:
 
         app.add_handler(conv)
         logger.info("Бот запущен")
+        print("Бот запущен...")
         app.run_polling()
 
 
