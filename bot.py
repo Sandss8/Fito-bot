@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import random
 from PIL import Image
 from telegram import (
-    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InputFile
+    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -479,6 +479,7 @@ class BotController:
         logger.info("Бот запущен")
         print("Бот запущен...")
         app.run_polling()
+        print("Бот остановлен.")
 
 
 if __name__ == "__main__":
